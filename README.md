@@ -27,6 +27,18 @@ There are two objectives to this project:
 2) Understand customer behaviour through effective
 segmentation to recommend tailored customer targeting strategies.
 
+## Methodology
+
+For this project, we addopted the following process:
+
+1) Data Cleaning & Preperation
+2) Exploratory Data Analysis
+3) Feature Engineering
+4) Machine Learning Modelling
+5) Model Evaluation
+6) Model Deployment
+
+
 
 
 
