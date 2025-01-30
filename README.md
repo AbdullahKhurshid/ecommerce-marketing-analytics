@@ -29,14 +29,18 @@ segmentation to recommend tailored customer targeting strategies.
 
 ## Methodology
 
-For this project, we addopted the following process:
+For this project, we adopted the following process:
 
-1) Data Cleaning & Preperation
+1) Data Cleaning & Preparation
 2) Exploratory Data Analysis
 3) Feature Engineering
 4) Machine Learning Modelling
 5) Model Evaluation
 6) Model Deployment
+
+The steps taken in the above steps can be found in the code documentation file and supporting it would be a codebook for all the variables in the code.
+
+
 
 
 
