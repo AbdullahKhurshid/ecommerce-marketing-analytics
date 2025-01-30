@@ -1,0 +1,591 @@
+---
+title: "DSA306_final"
+output: html_document
+date: "2023-11-11"
+---
+
+##------------------------
+#SECTION 1: Big Data Apache File Format
+##------------------------
+1.1 Reading the csv file and saving it as Parquet format
+```{r}
+# OPEN CSV FILE HERE
+transactions <- arrow::open_dataset(sources = "transactions.csv", format = "csv")
+#SAVE DATASET IN PARQUET FORMAT HERE
+#Create directory
+dir.create("parquet_folder")  
+#write parquet file to directory
+arrow::write_dataset(transactions,format = "parquet", path = "parquet_folder",partitioning = NULL)
+```
+
+
+1.2 Opening the parquet file and create a reference in Spark
+```{r}
+#OPEN SAVED PARQUET FILE HERE
+transaction_parquet <- arrow::open_dataset(
+  sources = "parquet_folder/part-0.parquet",
+  format = "parquet")
+
+library(dplyr)
+
+# Collect the data into a data frame
+transaction_df <- transaction_parquet |>
+  dplyr::collect()
+
+
+library(sparklyr)
+
+# Connect to a local instance of Spark
+sc <- spark_connect(master = "local", version = "3.4.0")
+
+# Copy the transactions R data frame to Spark memory and create the R reference transaction_ref
+transaction_ref <- copy_to(sc, transaction_df)    
+head(transaction_ref, 4)  
+```
+
+##------------------------
+#SECTION 2.1: Data Checking
+##------------------------
+
+2.1.1 Generating summary statistics for every column - applicable to numerical variables
+```{r}
+#summary statistics for every column
+sdf_describe(transaction_ref, cols = colnames(transaction_ref)) 
+```
+
+2.1.2 Checking for null values in every column
+```{r}
+#check the number of na values present in every column 
+na_values <- transaction_ref |>
+  summarise_all(~sum(as.integer(is.na(.))))
+na_values
+```
+
+2.1.3 Checking for unique values in different columns 
+```{r}
+#check for unique values, can modify parameter in select() to check for unique values in other columns 
+unique_values <- transaction_ref |>
+  select(ProductName) |>
+  distinct()
+
+unique_values
+```
+
+2.1.4 Checking for negative values in the Quantity column
+```{r}
+transaction_ref |> 
+  filter(Quantity < 0)
+```
+
+2.1.5 Checking for outliers where Quantity is extremely large
+```{r}
+transaction_ref |>
+  filter(Quantity >10000) 
+```
+
+##------------------------
+#SECTION 2.2: Data Cleaning
+##------------------------
+
+2.2.1 removing rows with NA CustomerNo, and rows with negative quantity
+
+```{r}
+transaction_clean <- transaction_ref |>
+  filter(!is.na(CustomerNo) & (Quantity > 0 & Quantity < 10000) & !is.null(CustomerNo))
+
+```
+
+2.2.2 Converting date to date format
+```{r}
+library(dplyr)
+
+transaction_clean <- transaction_clean |>
+    mutate(
+    month = substring_index(Date, "/", 1), 
+    day = substring_index(substring_index(Date, "/", -2), "/", 1),
+    year = substring_index(Date, "/", -1)
+  ) 
+# Add leading zeros to month and day
+transaction_clean <- transaction_clean |>
+  mutate(
+    month = lpad(month, 2, "0"),
+    day = lpad(day, 2, "0")
+  )
+
+# Combine the formatted values to create the "yyyy-mm-dd" date
+transaction_clean <- transaction_clean |>
+  mutate(FormattedDate = concat(year, "-", month, "-", day)) |>
+  dplyr::select(-month, -day, -year, -Date)
+
+#convert to date format from character format
+transaction_clean <-transaction_clean |>
+  mutate(FormattedDate = to_date(FormattedDate))
+
+transaction_clean
+```
+
+##------------------------
+#SECTION 3: Customer EDA and Visualization
+##------------------------
+
+3.1 Geographical Analysis
+```{r}
+#countries with the most customers 
+library(dbplot)
+library(ggplot2)
+country_plot <- transaction_clean |> 
+  mutate(Country = ifelse(Country == "United Kingdom", Country, "Others"))
+
+#plot geographical distribution of sales
+dbplot_bar(country_plot, x = Country, Customers = n_distinct(CustomerNo)) + 
+  theme_minimal()
+```
+
+3.2 Visualizing transaction volume by month
+```{r}
+#monthly transactions
+temp_df1 <- transaction_clean |> 
+  mutate(month = Month(FormattedDate)) |>
+  group_by(month) |>
+  summarize(Number_of_transactions = n_distinct(TransactionNo)) |>
+  collect()
+
+#plot number of transactions against months
+ggplot(temp_df1, aes(x = month, y = Number_of_transactions)) +
+  geom_line() + 
+  scale_x_continuous(breaks = 1:12, labels = month.abb[1:12]) +
+  labs(x = "Month", y = "Number of Transactions") + 
+  theme_minimal()
+```
+
+3.3 Average spend per transaction
+```{r}
+#average spend per transaction
+temp_df2 <- transaction_clean |>
+  group_by(TransactionNo) |>
+  summarize(avg_spend = sum(Price*Quantity)/n_distinct(TransactionNo))
+
+sdf_describe(temp_df2, cols = "avg_spend")
+
+temp_df2 <- temp_df2 |>
+  filter(avg_spend < 25000) |>
+  collect() #collect back to r for visualization purposes
+
+#plotting average spend per transaction
+ggplot(temp_df2, aes(x = avg_spend)) +
+  geom_histogram(binwidth = 1000, fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "Histogram of Average Spend per Transaction", x = "Average Spend", y = "Frequency") +
+  theme_minimal()
+```
+
+3.4 Number of unique products bought per customer
+```{r}
+#number of unique products bought per customer
+temp_df3 <- transaction_clean |>
+  group_by(CustomerNo) |>
+  summarize(no_of_unique_products = n_distinct(ProductNo))
+
+sdf_describe(temp_df3, cols = "no_of_unique_products")
+
+temp_df3 <- temp_df3 |>
+  filter(no_of_unique_products < 500) |>
+  collect() #collect back to r for visualization purposes
+
+#plotting number of unique products bought per customer
+ggplot(temp_df3, aes(x = no_of_unique_products)) +
+  geom_histogram(binwidth = 10, fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "Histogram of unique products bought per customer", x = "Number of Unique Products", y = "Frequency") + 
+  theme_minimal()
+```
+
+3.5 Average Basket Size
+```{r}
+#average basket size per customer
+temp_df4 <- transaction_clean |>
+  group_by(CustomerNo) |>
+  summarize(avg_basket_size = sum(Quantity)/n_distinct(TransactionNo))
+
+sdf_describe(temp_df4, cols = "avg_basket_size")
+
+temp_df4 <- temp_df4 |>
+  filter(avg_basket_size < 5000) |>
+  collect() #collect back to r for visualization purposes
+
+#plotting average basket size per customer
+ggplot(temp_df4, aes(x = avg_basket_size)) +
+  geom_histogram(binwidth = 50, fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "Histogram of Average Basket Size per customer", x = "Average Basket Size", y = "Frequency") + 
+  theme_minimal()
+
+```
+
+##------------------------
+#SECTION 4: Feature Engineering 
+##------------------------
+
+4.1 Feature engineering for ref_customer
+```{r}
+ref_customer <- transaction_clean |>
+  filter(Country == "United Kingdom") |>
+  group_by(CustomerNo) |>
+  summarise(
+    Recency = as.numeric(datediff(to_date("2019-12-09"), max(FormattedDate))),
+    Frequency = n_distinct(TransactionNo),
+    Monetary = sum(Price * Quantity),
+    duration = as.numeric(datediff(max(FormattedDate), min(FormattedDate))),
+    unique_products = n_distinct(ProductName), 
+    average_basket_size = sum(Quantity)/n_distinct(TransactionNo), 
+    avg_spend_per_trxcn = sum(Price*Quantity)/n_distinct(TransactionNo)
+    ) 
+
+#create a column to identify the month where the each customer spent the most
+temp_df5 <- transaction_clean |> 
+  select(CustomerNo, FormattedDate, Price,Quantity) |>
+  mutate(total_spent = Price*Quantity) |>
+  group_by(CustomerNo, month(FormattedDate)) |>
+  summarise(total_spent_per_month = sum(total_spent)) |>
+  group_by(CustomerNo) |>
+  filter(total_spent_per_month == max(total_spent_per_month)) |>
+  group_by(CustomerNo) |>
+  mutate(rank = row_number(total_spent_per_month)) |>
+  filter(rank == 1) |>
+  rename(month_with_max_spending = "month(FormattedDate)") |>
+  select(CustomerNo, month_with_max_spending)
+
+#left_join the customer_ref with the month_with_max_spending column in temp_df
+ref_customer <- left_join(ref_customer, temp_df5, by = "CustomerNo")
+
+#recode the values in month_with_max_spending to 0 or 1, where customers who spent the most within October to December period will be assigned 1 and the rest are assigned 0. This feature will be used to idenitfy festive spenders. 
+ref_customer <- ref_customer |>
+  mutate(month_with_max_spending = ifelse(month_with_max_spending >= 10, "1", "0")) |>
+  rename(festive_spender = month_with_max_spending)
+
+
+#to create target variable, find the median duration
+median_duration <- ref_customer |>
+  summarize(median_duration = median(duration)) |>
+  collect()
+
+#column for target variable - target engineering 
+ref_customer <- ref_customer |>
+  mutate(loyal_customer = ifelse(duration > !!median_duration$median_duration, 1, 0))
+
+ref_customer
+```
+
+##------------------------
+#SECTION 5.1: Modelling in Spark - Logistic Regression
+##------------------------
+
+5.1.1 Correlation Analysis
+```{r}
+library(corrr)
+library(ggplot2)
+
+#correlation matrix of all numeric predictor variables
+corr_matrix <- ref_customer |>
+  select(-CustomerNo, -duration, -festive_spender, -loyal_customer) |>
+  correlate(use = "pairwise.complete.obs", method = "pearson")
+
+
+#plot the correlation matrix
+corr_matrix |>
+  shave(upper = TRUE) |>
+  rplot() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#Remove average_spend_per_trxcn since it is highly correlated with average basket size
+```
+
+5.1.2 Splitting into training and testing set
+```{r}
+#assigning 80% to training set and 20% to testing set
+ref_customer_split <- ref_customer |>  
+  sdf_random_split(training = 0.8, testing = 0.2, seed = 44)
+
+ref_customer_split_train <- ref_customer_split$training #training set
+ref_customer_split_test <- ref_customer_split$testing #testing set
+
+ref_customer_split_train
+```
+
+5.1.3 Standardisation of variables 
+```{r}
+#standardised values
+
+#get the mean and standard deviation values based on the training set
+ref_customer_stats <- ref_customer_split_train |>
+  summarize(
+    r_mean = mean(Recency), r_sd = sd(Recency), 
+    f_mean = mean(Frequency), f_sd = sd(Frequency),
+    m_mean = mean(Monetary), m_sd = sd(Monetary), 
+    unique_product_mean = mean(unique_products), unique_product_sd = sd(unique_products), 
+    avg_basket_size_mean = mean(average_basket_size), avg_basket_size_sd = sd(average_basket_size)
+  ) |> collect() #bring back to local r
+
+#apply it to the training set
+ref_customer_split_train <- ref_customer_split_train |>
+  mutate(R_standardized = (Recency - !!ref_customer_stats$r_mean) / !!ref_customer_stats$r_sd,
+         F_standardized = (Frequency - !!ref_customer_stats$f_mean) / !!ref_customer_stats$f_sd,
+         M_standardized = (Monetary - !!ref_customer_stats$m_mean) / !!ref_customer_stats$m_sd, 
+         unique_products_standardized = (unique_products - !!ref_customer_stats$unique_product_mean) / !!ref_customer_stats$unique_product_sd,
+         average_basket_size_standardized = (average_basket_size - !!ref_customer_stats$avg_basket_size_mean) / !!ref_customer_stats$avg_basket_size_sd) 
+
+#apply it to the test set
+ref_customer_split_test <- ref_customer_split_test |>
+  mutate(R_standardized = (Recency - !!ref_customer_stats$r_mean) / !!ref_customer_stats$r_sd,
+         F_standardized = (Frequency - !!ref_customer_stats$f_mean) / !!ref_customer_stats$f_sd,
+         M_standardized = (Monetary - !!ref_customer_stats$m_mean) / !!ref_customer_stats$m_sd, 
+         unique_products_standardized = (unique_products - !!ref_customer_stats$unique_product_mean) / !!ref_customer_stats$unique_product_sd,
+         average_basket_size_standardized = (average_basket_size - !!ref_customer_stats$avg_basket_size_mean) / !!ref_customer_stats$avg_basket_size_sd) 
+ref_customer_split_train |>
+  sdf_describe(cols = c("R_standardized","F_standardized","M_standardized","unique_products_standardized","average_basket_size_standardized"))
+
+```
+
+5.1.4 Evaluating the models
+```{r}
+
+#Model_1 only containing standardised RFM values
+Model_1<- ref_customer_split_train |> 
+  ml_logistic_regression(formula = loyal_customer ~ M_standardized + F_standardized + R_standardized)
+
+validation_summary1 <- ml_evaluate(Model_1, dataset = ref_customer_split_test)
+validation_summary1$area_under_roc() #value is 0.936
+
+Model_1
+
+#Model_2 containing all the predictor variables except avg_spend_per_trxcn
+Model_2 <- ref_customer_split_train |>
+  ml_logistic_regression(formula = loyal_customer ~ M_standardized + F_standardized + R_standardized + average_basket_size_standardized + unique_products_standardized + festive_spender)
+
+validation_summary2 <- ml_evaluate(Model_2, dataset = ref_customer_split_test)
+validation_summary2$area_under_roc() #value is 0.938
+
+Model_2 #Model_2 is the chosen model
+
+```
+5.1.5 Confidence Interval plot - with all the variables 
+```{r}
+#confidence interval (CI) of predictor variables in Model_2
+tidy_glm_fit <- ref_customer_split_train |>
+  ml_generalized_linear_regression(
+    formula = loyal_customer ~ M_standardized + F_standardized + R_standardized + average_basket_size_standardized + unique_products_standardized + festive_spender
+  ) |> tidy() |> collect() #collect back to r for visualization purposes
+
+#CI Plot
+library(ggplot2)
+
+tidy_glm_fit |>
+  ggplot(aes(x = term, y = estimate)) + geom_point(size = 0.5) + geom_errorbar(
+    aes(ymin = estimate - 1.96 * std.error, ymax = estimate + 1.96 * std.error),
+    width = 0.1 )+
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  coord_flip() +
+  labs(title = "Confidence Intervals",
+       subtitle = "Parameter estimates with approximate 95% confidence intervals" )
+
+```
+
+##------------------------
+#SECTION 5.2: ML Pipeline - Logistic Regression
+##------------------------
+
+5.2.1 Logistic Regression ML Pipeline
+```{r}
+#ML Pipeline Logistic Regression
+logistic_pipeline <- ml_pipeline(sc) |>
+  ft_string_indexer(
+    input_col = "festive_spender",
+    output_col = "festive_spender_indexed"
+    ) |>
+  ft_one_hot_encoder(
+    input_col = "festive_spender_indexed",
+    output_col = "festive_spender_encoded"
+  ) |>
+  ft_vector_assembler(
+    input_cols = c("Monetary", "Frequency", "Recency","average_basket_size","unique_products"),
+    output_col = "continuous_features"
+  ) |>
+  ft_standard_scaler(
+    input_col = "continuous_features",
+    output_col = "stdz_continuous_features",
+    with_mean = TRUE
+  ) |>
+    ft_vector_assembler(
+    input_cols = c("stdz_continuous_features","festive_spender_encoded"),
+    output_col = "all_features"
+  ) |>
+  ml_logistic_regression(
+    features_col = "all_features",
+    label_col = "loyal_customer"
+  )
+
+logistic_pipeline
+
+```
+
+5.2.2 Cross validation 
+```{r}
+#cross-validation with elastic net
+cv <- ml_cross_validator(
+  sc,
+  estimator = logistic_pipeline,
+  estimator_param_maps = list(
+    logistic_regression = list(
+      elastic_net_param = c(0, 0.25, 0.5, 0.75,1), #alpha value range
+      reg_param = c(0, 0.001, 0.01, 0.1) #lambda value range
+    )
+  ),
+  evaluator = ml_binary_classification_evaluator(
+    sc,
+    label_col = "loyal_customer"
+  ),
+  num_folds = 10,
+  parallelism = 4,
+  seed = 1337
+)
+
+#created pipeline model 
+cv_model <- ml_fit(cv, ref_customer_split_train) 
+
+ml_validation_metrics(cv_model) |>
+  arrange(desc(areaUnderROC)) #showed best case where alpha & lambda are 0
+
+#save the pipeline model to disk
+ml_save(cv_model$best_model, path = "spark_model1", overwrite = TRUE)
+
+
+```
+
+
+##------------------------
+#SECTION 5.3: Modelling in Spark - Kmeans Clustering
+##------------------------
+
+5.3.1 Determining the optimal number of clusters 
+```{r}
+#standardize RFM values
+#get the mean and standard deviation values based on the whole ref_customer dataset
+rfm_stats <- ref_customer |>
+  summarize(
+    r_mean = mean(Recency), r_sd = sd(Recency), 
+    f_mean = mean(Frequency), f_sd = sd(Frequency),
+    m_mean = mean(Monetary), m_sd = sd(Monetary), 
+   ) |> collect() #bring back to local r
+
+#apply it to the whole dataset
+ref_customer_for_kmeans <- ref_customer |>
+  mutate(R_standardized = (Recency - !!rfm_stats$r_mean) / !!rfm_stats$r_sd,
+         F_standardized = (Frequency - !!rfm_stats$f_mean) / !!rfm_stats$f_sd,
+         M_standardized = (Monetary - !!rfm_stats$m_mean) / !!rfm_stats$m_sd)
+
+#iterate through the different values of k 
+k_values <- c(2, 3, 4, 5, 6)
+silhouette_scores <- numeric(length(k_values))
+
+for (i in 1:length(k_values)) {
+  k <- k_values[i]
+  
+  k_means_model <- ref_customer_for_kmeans |>
+    ml_kmeans(
+      formula = ~ R_standardized + F_standardized + M_standardized,
+      k = k, 
+      max_iter = 1000, 
+      init_mode = "random",
+      seed = 8472
+    )
+  #calculate silhouette scores
+  silhouette_scores[i] <- ml_compute_silhouette_measure(
+  k_means_model,
+  dataset = ref_customer_for_kmeans,
+  distance_measure = "squaredEuclidean"
+)
+  
+}
+
+#find the best value of k - plot silhouette score against k values 
+library(ggplot2)
+
+# Create a data frame for k values and silhouette scores
+silhouette_data <- data.frame(k = k_values, silhouette_score = silhouette_scores)
+
+silhouette_data
+
+#plot of silhoutte scores against k-values
+ggplot(silhouette_data, aes(k,silhouette_score)) +
+  geom_line() +
+  theme_minimal()
+
+#as shown in the plot k = 4 is the optimal number of clusters 
+```
+
+
+##------------------------
+#SECTION 5.4: ML Pipeline - Kmeans Clustering
+##------------------------
+
+5.4.1 Creating the pipeline, fitting the model and saving it to disk
+```{r}
+kmeans_pipeline <- ml_pipeline(sc) |>
+  ft_vector_assembler(
+    input_cols = c("Recency","Frequency","Monetary"),
+    output_col = "features"
+  ) |>
+  ft_standard_scaler(
+    input_col = "features",
+    output_col = "features_stdz",
+    with_mean = TRUE
+  ) |>
+  ml_kmeans(
+    features_col = "features_stdz",
+    prediction_col = "cluster",
+    k=4,
+    max_iter = 1000,
+    init_mode = "random",
+    seed = 8472
+  ) 
+
+#created pipeline model 
+kmeans_pipeline_model <- ml_fit(kmeans_pipeline, ref_customer)
+
+#save the pipeline model to disk
+ml_save(kmeans_pipeline_model, path = "spark_model2", overwrite = TRUE)
+```
+
+
+5.4.3 Understanding the clusters
+```{r}
+#Every customer is assigned to one of the 4 clusters - 0,1,2,3
+#What do these clusters mean? 
+predictions <- ml_transform(kmeans_pipeline_model, ref_customer)
+
+#group by the cluster and get the mean values of RFM 
+predictions |>
+  group_by(cluster) |>
+  summarise(
+    mean_recency = mean(Recency), 
+    mean_frequency = mean(Frequency), 
+    mean_monetary = mean(Monetary)
+  ) |>
+  arrange(cluster) 
+```
+
+
+5.5 Deploy models to production using Plumber
+```{r}
+#kmeans
+library(plumber)
+#Start a Web Service
+plumb(file = "spark-plumber2.R") |>
+  pr_run(port = 8000)
+```
+
+```{r}
+#logistic
+library(plumber)
+#Start a Web Service
+plumb(file = "spark-plumber1.R") |>
+  pr_run(port = 8000)
+```
+
